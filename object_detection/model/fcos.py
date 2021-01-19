@@ -2,14 +2,17 @@ from typing import NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from backbone import EfficientNetBackbone
 
 class FCOSConfig(NamedTuple):
+    backbone_name: str
     img_h: int
     img_w: int
     x8_ch: int
     x16_ch: int
     x32_ch: int
     fpn_ch: int
+    n_cls: int
 
 class FeaturePyramid(nn.Module):
     def __init__(self, cfg: FCOSConfig):
@@ -48,19 +51,70 @@ class FeaturePyramid(nn.Module):
 
         return out_8, out_16, out_32, out_64, out_128
 
-def test_fpn():
-    from backbone import EfficientNetBackbone
+class FCOSHead(nn.Module):
+    def __init__(self, cfg: FCOSConfig, downsample: int):
+        super().__init__()
+        self.regression_net = self._generate_conv_block(cfg.fpn_ch, 4)
+        self.regression_head = nn.Sequential(
+            nn.Conv2d(cfg.fpn_ch, 4, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.classification_net = self._generate_conv_block(cfg.fpn_ch, 4)
+        self.classification_head = nn.Conv2d(cfg.fpn_ch, cfg.n_cls, kernel_size=3, stride=1, padding=1)
+        self.centerness_head = nn.Conv2d(cfg.fpn_ch, 1, kernel_size=3, stride=1, padding=1)
+        self.downsample = downsample
 
-    b = EfficientNetBackbone("tf_efficientnet_b0_ns")
-    print(b)
-    f = FeaturePyramid(FCOSConfig(800, 1024, 40, 112, 320, 256))
-    print(f)
+    @staticmethod
+    def _generate_conv_block(c: int, rep: int):
+        ret = []
+        for _ in range(rep):
+            ret += [
+                nn.Conv2d(c, c, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(c),
+                nn.ReLU(inplace=True),
+            ]
+        return nn.Sequential(*ret)
+
+    def forward(self, x):
+        y_reg = self.regression_net(x)
+        y_cls = self.classification_net(x)
+        out_reg = self.regression_head(y_reg) * self.downsample  # scaling
+        out_cls = self.classification_head(y_cls)
+        out_center = self.centerness_head(y_cls)
+        return out_reg, out_cls, out_center
+
+
+class FCOS(nn.Module):
+    def __init__(self, cfg: FCOSConfig):
+        super().__init__()
+        self.backbone = EfficientNetBackbone(cfg.backbone_name)
+        self.fpn = FeaturePyramid(cfg)
+        self.head_8 = FCOSHead(cfg, 8)
+        self.head_16 = FCOSHead(cfg, 16)
+        self.head_32 = FCOSHead(cfg, 32)
+        self.head_64 = FCOSHead(cfg, 64)
+        self.head_128 = FCOSHead(cfg, 128)
+
+    def forward(self, x):
+        x8, x16, x32 = self.backbone(x)
+        y8, y16, y32, y64, y128 = self.fpn(x8, x16, x32)
+        o8 = self.head_8(y8)
+        o16 = self.head_16(y16)
+        o32 = self.head_32(y32)
+        o64 = self.head_64(y64)
+        o128 = self.head_128(y128)
+        return o8, o16, o32, o64, o128
+
+def check():
+
+    cfg = FCOSConfig("tf_efficientnet_b0_ns", 800, 1024, 40, 112, 320, 256, 80)
+    model = FCOS(cfg)
+    print(model)
     x = torch.zeros((1, 3, 800, 1024))
     print(x.shape)
-    x8, x16, x32 = b(x)
-    print(x8.shape, x16.shape, x32.shape)
-    o8, o16, o32, o64, o128 = f(x8, x16, x32)
-    print(o8.shape, o16.shape, o32.shape, o64.shape, o128.shape)
+    o8, o16, o32, o64, o128 = model(x)
+    o_reg, o_cls, o_center = o8
+    print(o_reg.shape, o_cls.shape, o_center.shape)
 
 if __name__ == "__main__":
-    test_fpn()
+    check()
